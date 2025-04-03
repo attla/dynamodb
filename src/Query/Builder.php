@@ -3,6 +3,7 @@
 namespace Attla\Dynamodb\Query;
 
 use Attla\Dynamodb\Connection;
+use Attla\Support\Arr as AttlaArr;
 use Illuminate\Support\{ Arr, Str };
 use Illuminate\Database\Query\{
     Expression,
@@ -556,6 +557,7 @@ class Builder extends BaseBuilder
     /** @inheritdoc */
     public function whereIn($column, $values, $boolean = 'and', $not = false)
     {
+        $values = AttlaArr::toArray($values);
         $column = $this->expression_attributes->addName($column);
         foreach ($values as &$value) {
             $value = $this->expression_attributes->addValue($value);
@@ -567,6 +569,7 @@ class Builder extends BaseBuilder
     /** @inheritdoc */
     public function whereBetween($column, iterable $values, $boolean = 'and', $not = false)
     {
+        $values = AttlaArr::toArray($values);
         $column = $this->expression_attributes->addName($column);
         foreach ($values as &$value) {
             $value = $this->expression_attributes->addValue($value);
