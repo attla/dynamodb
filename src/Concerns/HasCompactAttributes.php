@@ -2,6 +2,8 @@
 
 namespace Attla\Dynamodb\Concerns;
 
+use Illuminate\Support\Arr;
+
 trait HasCompactAttributes
 {
     /**
@@ -10,6 +12,20 @@ trait HasCompactAttributes
      * @var array<mixed>
      */
     protected $_c = [];
+
+    /**
+     * Store sub attributes key map
+     *
+     * @var array<string, mixed>
+     */
+    public $_k = [];
+
+    /**
+     * Store fillable attributes
+     *
+     * @var array<int, string>
+     */
+    public $_f = [];
 
     /**
      * Replace maps of types
@@ -41,6 +57,55 @@ trait HasCompactAttributes
      * @var int
      */
     protected $jsonOptions = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION;
+
+    // LARAVEL Eloquent rewrites
+    /** @inheritdoc */
+    public function getFillable()
+    {
+        if (!empty($this->_f)) {
+            return $this->_f;
+        }
+
+        return $this->_f = array_map(function($key, $value) {
+            if (is_int($key)) {
+                return $value;
+            }
+
+            $this->_k[$key] = $value;
+            return $key;
+        }, array_keys($this->fillable), $this->fillable);
+    }
+
+    /**
+     * Flatten array of field mapped keys
+     *
+     * @param array $fields
+     * @param string|null $path
+     * @return array
+     */
+    protected function processFields($fields, $path = null)
+    {
+        $index = -1;
+        $result = [];
+        foreach ($fields as $key => $val) {
+            $index++;
+            $cPath = ($path !== null ? $path.'.' : '').$key;
+
+            if ($key === $index) {
+                $result[$key] = is_array($val) ? $this->processFields($val, $cPath) : $val;
+                continue;
+            }
+
+            if (is_array($val)) {
+                $result[$index] = $key;
+                $val = $this->processFields($val, $cPath);
+            }
+
+            $result[$cPath] = $val;
+        }
+
+        return $result;
+    }
 
     /**
      * Boot compact attributes
@@ -78,11 +143,80 @@ trait HasCompactAttributes
     {
         if (!empty($value = $this->attributes['v'] ?? [])) {
             $value = $this->decodeValue($value);
+
             $fillable = $this->fields();
+
             foreach ($fillable as $index => $field) {
-                $this->$field = $value[$index] ?? null;
+                $val = $value[$index] ?? null;
+                $this->$field = Arr::has($this->_k, $field) ? $this->retrieveNames($this->_k[$field], $val, $field) : $val;
             }
         }
+    }
+
+    /**
+     * Transforms array of key-value pairs into an object
+     *
+     * @param array $entries
+     * @return array
+     */
+    protected function fromEntries(array $entries): array {
+        return array_reduce($entries, function($acc, $entry) {
+            if (is_array($entry) && count($entry) == 2 && isset($entry[0]) && $entry[0] !== null) {
+                $acc[$entry[0]] = $entry[1] ?? null;
+            } else if (is_array($entry) && !isset($entry[0], $entry[1])) {
+                $acc[] = $entry;
+            }
+
+            return $acc;
+        }, []);
+    }
+
+    /**
+     * Retrieve labels of a array zip
+     *
+     * @param array<int|string, string|array<int|string.string> $keys
+     * @param mixed|null $value
+     * @param string|null $key
+     * @return array
+     */
+    protected function retrieveNames($keys, $value = null, $key = null)
+    {
+        if (!is_array($keys) || empty($value)) {
+            return $value;
+        }
+
+        if ($key === null){
+            $keys = $this->processFields($keys);
+        }
+
+        if (!is_array($value)) {
+            return [Arr::get($keys, $key), $value];
+        }
+
+        return $this->fromEntries(array_map(function ($index, $val) use ($keys, $key) {
+            $path = ($key !== null ? $key.'.' : '').$index;
+            $column = $matrix = Arr::has($keys, $path) ? $path : $index;
+
+            while (Arr::has($keys, $matrix)) {
+                $column = Arr::get($keys, $matrix);
+                if (is_array($column)) {
+                    $index = $matrix;
+                    $path = $index;
+                    break;
+                } else if ($column == $matrix) {
+                    break;
+                }
+
+                $matrix = $column;
+            }
+
+            if (is_array($val)) {
+                $matrix = Arr::has($keys, $path) ? $path : $matrix;
+                return [$index, $this->retrieveNames($keys, $val, $matrix)];
+            }
+
+            return [$matrix, $val];
+        }, array_keys($value), $value));
     }
 
     /**
@@ -114,7 +248,7 @@ trait HasCompactAttributes
      * @param string|null $event
      * @return void
      */
-    public function prepareCompacts(string $event = null)
+    public function prepareCompacts(string|null $event = null)
     {
         $data = [];
         $fillable = $this->fields();
@@ -208,16 +342,20 @@ trait HasCompactAttributes
      * Zip the attribute array
      *
      * @param array $array
+     * @param array &$seen
      * @return array
      */
-    protected function zipArray(array $array): array {
-        $seen = [];
+    protected function zipArray(array $array, &$seen = []): array {
         $result = [];
 
         foreach ($array as $index => $item) {
+            if (is_array($item)) {
+                $result[] = $this->zipArray($item, $seen);
+                continue;
+            }
+
             $length = match (gettype($item)) {
                 'string' => strlen($item),
-                'array' => count($item),
                 'array' => count($item),
                 'stdClass', 'object' => count(get_object_vars($item)),
                 'integer', 'double', 'float' => strlen((string) $item),
@@ -226,12 +364,14 @@ trait HasCompactAttributes
 
             if ($length > 2 && ($pos = array_search($item, $seen, true)) !== false) {
                 $result[] = "^$pos";
-            } else {
-                if (!in_array($item, [null, true, false], true)) {
-                    $seen[$index] = $item;
-                }
-                $result[] = $item;
+                continue;
             }
+
+            if (!in_array($item, [null, true, false], true)) {
+                $seen[] = $item;
+            }
+
+            $result[] = $item;
         }
 
         return $result;
@@ -241,15 +381,33 @@ trait HasCompactAttributes
      * Unzip the attribute array
      *
      * @param array $array
+     * @param array &$seen
+     * @param bool $deep
      * @return array
      */
-    protected function unzipArray(array $array): array {
+    protected function unzipArray(array $array, &$seen = [], $deep = false): array {
         foreach ($array as &$item) {
+            if (in_array($item, [null, true, false], true)) {
+                continue;
+            }
+
+            if (is_array($item)) {
+                $item = $this->unzipArray($item, $seen, true);
+                continue;
+            }
+
             $pos = is_string($item) && str_starts_with($item, '^')
                 ? (int) substr($item, 1)
                 : -1;
 
-            if ($pos > -1 && isset($array[$pos]) && !str_starts_with($val = $array[$pos], '^')) {
+            if ($pos < 0) {
+                $seen[] = $item;
+                continue;
+            }
+
+            if (!$deep && $pos > -1 && isset($array[$pos]) && !str_starts_with($val = $array[$pos], '^')) {
+                $item = $val;
+            } else if ($pos > -1 && isset($seen[$pos]) && !str_starts_with($val = $seen[$pos], '^')) {
                 $item = $val;
             }
         }
